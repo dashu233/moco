@@ -6,6 +6,8 @@ import sys
 import torch
 
 if __name__ == "__main__":
+    start_key = "module.encoder_q."
+    print('using {} as the backbone'.format(start_key))
     input = sys.argv[1]
 
     obj = torch.load(input, map_location="cpu")
@@ -13,10 +15,10 @@ if __name__ == "__main__":
 
     newmodel = {}
     for k, v in obj.items():
-        if not k.startswith("module.encoder_q."):
+        if not k.startswith(start_key):
             continue
         old_k = k
-        k = k.replace("module.encoder_q.", "")
+        k = k.replace(start_key, "")
         if "layer" not in k:
             k = "stem." + k
         for t in [1, 2, 3, 4]:

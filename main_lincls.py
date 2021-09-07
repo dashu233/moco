@@ -7,7 +7,7 @@ import random
 import shutil
 import time
 import warnings
-
+import torch.nn.utils.prune as prune
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -20,6 +20,7 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from utils import backup_code,para_count_conv_mask
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -79,13 +80,24 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 
 parser.add_argument('--pretrained', default='', type=str,
                     help='path to moco pretrained checkpoint')
+parser.add_argument('--output',type = str, default='output',help = 'output_checkpoint_dir')
 
 best_acc1 = 0
 
 
 def main():
     args = parser.parse_args()
-
+    if os.path.exists(args.output):
+        print('an existed dir, enter e or exit to cancel the command, or anything else to continue')
+        st = input()
+        if st in ['e','exit']:
+            exit()
+    else:
+        os.mkdir(args.output)
+    if not os.path.exists(os.path.join(args.output,'backup')):
+        os.mkdir(os.path.join(args.output,'backup'))
+    
+    backup_code('./',os.path.join(args.output,'backup'))
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -143,7 +155,10 @@ def main_worker(gpu, ngpus_per_node, args):
     # create model
     print("=> creating model '{}'".format(args.arch))
     model = models.__dict__[args.arch]()
-
+    # add prune_mask to model
+    for _,m in model.named_modules():
+        if isinstance(m,nn.Conv2d):
+            prune.random_unstructured(m,'weight',0)
     # freeze all layers but the last fc
     for name, param in model.named_parameters():
         if name not in ['fc.weight', 'fc.bias']:
@@ -151,6 +166,8 @@ def main_worker(gpu, ngpus_per_node, args):
     # init the fc layer
     model.fc.weight.data.normal_(mean=0.0, std=0.01)
     model.fc.bias.data.zero_()
+
+    
 
     # load from pre-trained, before DistributedDataParallel constructor
     if args.pretrained:
@@ -170,8 +187,8 @@ def main_worker(gpu, ngpus_per_node, args):
 
             args.start_epoch = 0
             msg = model.load_state_dict(state_dict, strict=False)
-            assert set(msg.missing_keys) == {"fc.weight", "fc.bias"}
-
+            #assert set(msg.missing_keys) == {"fc.weight", "fc.bias"}
+            print(msg.missing_keys)
             print("=> loaded pre-trained model '{}'".format(args.pretrained))
         else:
             print("=> no checkpoint found at '{}'".format(args.pretrained))
@@ -300,7 +317,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
-            }, is_best)
+            }, is_best,os.path.join(args.output,'checkpoint_{:04d}.pth.tar'.format(epoch)))
             if epoch == args.start_epoch:
                 sanity_check(model.state_dict(), args.pretrained)
 
@@ -489,11 +506,11 @@ def accuracy(output, target, topk=(1,)):
 
         _, pred = output.topk(maxk, 1, True, True)
         pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
+        correct = pred.eq(target.reshape(1, -1).expand_as(pred))
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 

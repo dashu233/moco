@@ -21,9 +21,12 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
-
+import json
 import moco.loader
 import moco.builder
+from torch.utils.tensorboard import SummaryWriter
+from utils import backup_code,para_count_conv_mask
+
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -39,7 +42,7 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                         ' (default: resnet50)')
 parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
                     help='number of data loading workers (default: 32)')
-parser.add_argument('--epochs', default=200, type=int, metavar='N',
+parser.add_argument('--epochs', default=50, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -48,9 +51,9 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
                          'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', '--learning-rate', default=0.03, type=float,
+parser.add_argument('--lr', '--learning-rate', default=0.003, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
-parser.add_argument('--schedule', default=[120, 160], nargs='*', type=int,
+parser.add_argument('--schedule', default=[30, 160], nargs='*', type=int,
                     help='learning rate schedule (when to drop lr by 10x)')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum of SGD solver')
@@ -78,6 +81,7 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
+parser.add_argument('--output',type = str, default='output',help = 'output_checkpoint_dir')
 
 # moco specific configs:
 parser.add_argument('--moco-dim', default=128, type=int,
@@ -89,6 +93,7 @@ parser.add_argument('--moco-m', default=0.999, type=float,
 parser.add_argument('--moco-t', default=0.07, type=float,
                     help='softmax temperature (default: 0.07)')
 
+
 # options for moco v2
 parser.add_argument('--mlp', action='store_true',
                     help='use mlp head')
@@ -98,8 +103,43 @@ parser.add_argument('--cos', action='store_true',
                     help='use cosine lr schedule')
 
 
+# my parser
+def str2bool(a:str):
+    return a.lower() == 'true'
+
+parser.add_argument('--prune_rate',type = float, default=0.9)
+parser.add_argument('--prune_steps',type = str, default='[10]')
+
+def deal_with_args(arg):
+    arg.prune_steps = json.loads(arg.prune_steps)
+    return arg
+def get_prune_rate(arg,ep):
+    epi = 0
+    for epi in arg.prune_steps:
+        if epi > ep:
+            break
+    return 1-(1-arg.prune_rate)**((arg.prune_steps.index(epi)+1)/len(arg.prune_steps))
+    
 def main():
     args = parser.parse_args()
+    args = deal_with_args(args)
+    print(args.prune_steps)
+    
+    if os.path.exists(args.output):
+        print('an existed dir, enter e or exit to cancel the command, or anything else to continue')
+        st = input()
+        if st in ['e','exit']:
+            exit()
+    else:
+        os.mkdir(args.output)
+    
+    if not os.path.exists(os.path.join(args.output,'log')):
+        os.mkdir(os.path.join(args.output,'log'))
+    if not os.path.exists(os.path.join(args.output,'backup')):
+        os.mkdir(os.path.join(args.output,'backup'))
+    
+    backup_code('./',os.path.join(args.output,'backup'))
+    
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -132,8 +172,17 @@ def main():
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
 
+def is_main_process(args):
+    if torch.distributed.is_initialized():
+        return args.rank % torch.cuda.device_count()
+    else:
+        return True
 
 def main_worker(gpu, ngpus_per_node, args):
+    if is_main_process(args):
+        writer = SummaryWriter(os.path.join(args.output,'log'))
+    else:
+        writer = None
     args.gpu = gpu
 
     # suppress printing if not master
@@ -156,11 +205,34 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     # create model
     print("=> creating model '{}'".format(args.arch))
-    model = moco.builder.MoCo(
+    model = moco.builder.MoCoUnstructruedPruned(
         models.__dict__[args.arch],
         args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
     print(model)
-
+    model.add_prune_mask()
+        # optionally resume from a checkpoint
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            if args.gpu is None:
+                checkpoint = torch.load(args.resume)
+            else:
+                # Map model to be loaded to specified single gpu.
+                loc = 'cuda:{}'.format(args.gpu)
+                checkpoint = torch.load(args.resume, map_location=loc)
+            args.start_epoch = checkpoint['epoch']
+            cp = {}
+            for ky in checkpoint['state_dict']:
+                cp[ky[7:]] = checkpoint['state_dict'][ky]
+            st = model.state_dict()
+            st.update(cp)
+            model.load_state_dict(st)
+            #optimizer.load_state_dict(checkpoint['optimizer'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+    
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
         # should always set the single device scope, otherwise,
@@ -196,7 +268,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
-    # optionally resume from a checkpoint
+    cudnn.benchmark = True
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
@@ -206,16 +278,12 @@ def main_worker(gpu, ngpus_per_node, args):
                 # Map model to be loaded to specified single gpu.
                 loc = 'cuda:{}'.format(args.gpu)
                 checkpoint = torch.load(args.resume, map_location=loc)
-            args.start_epoch = checkpoint['epoch']
-            model.load_state_dict(checkpoint['state_dict'])
+            
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
-
-    cudnn.benchmark = True
-
     # Data loading code
     traindir = os.path.join(args.data, 'train')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -263,7 +331,10 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, epoch, args,writer)
+        if epoch in args.prune_steps:
+            prune_rate = get_prune_rate(args,epoch)
+            model.module.prune_step(prune_rate)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
@@ -272,10 +343,10 @@ def main_worker(gpu, ngpus_per_node, args):
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
                 'optimizer' : optimizer.state_dict(),
-            }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(epoch))
+            }, is_best=False, filename= os.path.join(args.output,'checkpoint_{:04d}.pth.tar'.format(epoch)))
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, epoch, args,writer:SummaryWriter):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -320,6 +391,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+    if writer is not None:
+        writer.add_scalar('loss',losses.avg,epoch)
+        writer.add_scalar('top1',top1.avg,epoch)
+        writer.add_scalar('prune_rate',get_prune_rate(args,epoch),epoch)
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
@@ -393,7 +468,7 @@ def accuracy(output, target, topk=(1,)):
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 

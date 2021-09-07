@@ -1,7 +1,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import torch
 import torch.nn as nn
-
+import torch.nn.utils.prune as prune
 
 class MoCo(nn.Module):
     """
@@ -158,6 +158,37 @@ class MoCo(nn.Module):
         self._dequeue_and_enqueue(k)
 
         return logits, labels
+
+
+class MoCoUnstructruedPruned(MoCo):
+    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, mlp=False):
+        super().__init__(base_encoder, dim=dim, K=K, m=m, T=T, mlp=mlp)
+
+        self.parameters_to_prune = []
+        
+    def prune_step(self,param_prune_rate:float):
+
+        # global prune encoder_q 
+        print('pruning percent:{}'.format(param_prune_rate))
+        prune.global_unstructured(
+            self.parameters_to_prune,
+            pruning_method=prune.L1Unstructured,
+            amount=param_prune_rate,
+        )
+
+    def add_prune_mask(self):
+        # add prune mask for query
+        
+        for _,m in self.encoder_q.named_modules():
+            if isinstance(m,nn.Conv2d):
+                prune.random_unstructured(m,'weight',0)
+                self.parameters_to_prune.append((m,'weight'))
+        for _,m in self.encoder_k.named_modules():
+            if isinstance(m,nn.Conv2d):
+                prune.random_unstructured(m,'weight',0)
+                
+        self.parameters_to_prune = tuple(self.parameters_to_prune)
+
 
 
 # utils
