@@ -161,11 +161,24 @@ class MoCo(nn.Module):
 
 
 class MoCoUnstructruedPruned(MoCo):
-    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, mlp=False):
+    def __init__(self, base_encoder, args,dim=128, K=65536, m=0.999, T=0.07, mlp=False):
         super().__init__(base_encoder, dim=dim, K=K, m=m, T=T, mlp=mlp)
-
+        self.args = args
         self.parameters_to_prune = []
-        
+    
+    @torch.no_grad()
+    def _momentum_update_key_encoder(self):
+        """
+        Momentum update of the key encoder, mask value will goes to zero
+        """
+        for name,para in self.encoder_q.named_parameters():
+            if '_orig' in name:
+                self.encoder_k.state_dict()[name].data = self.encoder_k.state_dict()[name].data * self.m \
+                    + torch.mul(para.data, self.encoder_q.state_dict()[name.replace('_orig','_mask')]) * (1. - self.m)
+            else:
+                self.encoder_k.state_dict()[name].data = self.encoder_k.state_dict()[name].data * self.m \
+                    + para.data * (1. - self.m)
+
     def prune_step(self,param_prune_rate:float):
 
         # global prune encoder_q 

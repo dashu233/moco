@@ -9,6 +9,10 @@ from detectron2.engine import DefaultTrainer, default_argument_parser, default_s
 from detectron2.evaluation import COCOEvaluator, PascalVOCDetectionEvaluator
 from detectron2.layers import get_norm
 from detectron2.modeling.roi_heads import ROI_HEADS_REGISTRY, Res5ROIHeads
+from detectron2.modeling import build_model
+import logging
+import torch
+import torch.nn.utils.prune as prune
 
 
 @ROI_HEADS_REGISTRY.register()
@@ -35,7 +39,20 @@ class Trainer(DefaultTrainer):
         else:
             assert "voc" in dataset_name
             return PascalVOCDetectionEvaluator(dataset_name)
-
+    
+    @classmethod
+    def build_model(cls, cfg):
+        model = build_model(cfg)
+        # create mask and weight_orig before paralleling
+        for name, module in model.backbone.named_modules():
+            if isinstance(module, torch.nn.Conv2d):
+                prune.l1_unstructured(module, name='weight', amount=0)
+        for name, module in model.roi_heads.named_modules():
+            if isinstance(module, torch.nn.Conv2d):
+                prune.l1_unstructured(module, name='weight', amount=0)
+        logger = logging.getLogger(__name__)
+        logger.info("Model:\n{}".format(model))
+        return model
 
 def setup(args):
     cfg = get_cfg()

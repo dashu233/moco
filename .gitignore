@@ -1,6 +1,8 @@
 # output dir
 output
+detection/output
 datasets
+.git
 experiments
 instant_test_output
 inference_test_output
@@ -17,6 +19,7 @@ _ext
 *.so
 data/
 output/
+.git/
 *egg-info/**
 
 # pytorch/python/numpy formats

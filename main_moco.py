@@ -109,6 +109,11 @@ def str2bool(a:str):
 
 parser.add_argument('--prune_rate',type = float, default=0.9)
 parser.add_argument('--prune_steps',type = str, default='[10]')
+parser.add_argument('--prune_method',type = str, default='IMP')
+parser.add_argument('--mask_encode',type=str,choices=['query','key','all'],default='query')
+parser.add_argument('--unstructure',type=str2bool,default='True')
+parser.add_argument('--mask_module',type=str,choices=['conv','bn'],default='conv')
+
 
 def deal_with_args(arg):
     arg.prune_steps = json.loads(arg.prune_steps)
@@ -139,7 +144,7 @@ def main():
         os.mkdir(os.path.join(args.output,'backup'))
     
     backup_code('./',os.path.join(args.output,'backup'))
-    
+
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -206,7 +211,7 @@ def main_worker(gpu, ngpus_per_node, args):
     # create model
     print("=> creating model '{}'".format(args.arch))
     model = moco.builder.MoCoUnstructruedPruned(
-        models.__dict__[args.arch],
+        models.__dict__[args.arch],args,
         args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
     print(model)
     model.add_prune_mask()
