@@ -1,4 +1,5 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+from numpy.lib.financial import ipmt
 import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
@@ -159,6 +160,9 @@ class MoCo(nn.Module):
 
         return logits, labels
 
+class Identity(nn.Module):
+    def forward(self,x):
+        return x
 
 class MoCoUnstructruedPruned(MoCo):
     def __init__(self, base_encoder, args,dim=128, K=65536, m=0.999, T=0.07, mlp=False):
@@ -178,6 +182,7 @@ class MoCoUnstructruedPruned(MoCo):
             else:
                 self.encoder_k.state_dict()[name].data = self.encoder_k.state_dict()[name].data * self.m \
                     + para.data * (1. - self.m)
+        
 
     def prune_step(self,param_prune_rate:float):
 
@@ -217,3 +222,148 @@ def concat_all_gather(tensor):
 
     output = torch.cat(tensors_gather, dim=0)
     return output
+
+class CAMMoCo(MoCoUnstructruedPruned):
+    def __init__(self, base_encoder, args, dim=128, K=65536, m=0.999, T=0.07, mlp=False):
+        super().__init__(base_encoder, args, dim=dim, K=K, m=m, T=T, mlp=mlp)
+        self.encoder_k.avg_pool = Identity()
+        self.encoder_q.avg_pool = Identity()
+        dim_mlp = self.encoder_q.fc[0].weight.shape[1]
+        dim_cat = self.encoder_q.fc[2].weight.shape[0]
+        self.encoder_q.fc = Identity()
+        self.encoder_k.fc = Identity()
+        self.encoder_q_head = nn.Sequential(nn.Conv2d(dim_mlp,dim_mlp,1),nn.ReLU(),nn.Conv2d(dim_mlp,dim_cat,1))
+        self.encoder_k_head = nn.Sequential(nn.Conv2d(dim_mlp,dim_mlp,1),nn.ReLU(),nn.Conv2d(dim_mlp,dim_cat,1))
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+    def load_state_dict_from_MoCo(self,state_dict):
+        st = self.state_dict()
+        for ky in state_dict:
+            if ky[7:] in st:
+                #print('load {} in original model para'.format(ky))
+                st[ky[7:]] = state_dict[ky]
+            else:
+                #print(ky)
+                if ky == 'module.encoder_q.fc.0.weight' or ky == 'module.encoder_q.fc.2.weight':
+                    sp = state_dict[ky].shape
+                    st[ky[7:].replace('.fc','_head')] = state_dict[ky].reshape(sp[0],sp[1],1,1)
+                elif ky == 'module.encoder_q.fc.0.bias' or ky == 'module.encoder_q.fc.2.bias' :
+                    st[ky[7:].replace('.fc','_head')] = state_dict[ky]
+                else:
+                    print('missing key:',ky)
+        
+        self.load_state_dict(st)
+        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
+            param_k.data.copy_(param_q.data)  # initialize
+            param_k.requires_grad = False  # not update by gradient
+        for param_q, param_k in zip(self.encoder_q_head.parameters(), self.encoder_k_head.parameters()):
+            param_k.data.copy_(param_q.data)  # initialize
+            param_k.requires_grad = False  # not update by gradient
+        
+    def _pred_feature_center(self,cam_map):
+        B,C,H,W = cam_map.shape
+        cam_map = cam_map.permute(0,2,3,1)
+        # B,H,W,C
+        cam_prob_map = torch.softmax(cam_map,dim=3)
+        cam_prob_map = cam_prob_map.view(B,-1,C)
+
+        xind = torch.arange(0, H,step=1,dtype=torch.long)
+        yind = torch.arange(0, W,step=1,dtype=torch.long)
+        
+        grid_x,grid_y = torch.meshgrid([xind,yind])
+        grid_x = grid_x.view(1,-1,1)
+        grid_y = grid_y.view(1,-1,1)
+
+        mean_x = torch.sum(cam_prob_map*grid_x,dim=1)
+        mean_y = torch.sum(cam_prob_map*grid_y,dim=1)
+
+        # mean_{x,y}.shape = B,C
+        return mean_x,mean_y
+
+    @torch.no_grad()
+    def _momentum_update_key_encoder(self):
+        """
+        Momentum update of the key encoder, mask value will goes to zero
+        """
+        for name,para in self.encoder_q.named_parameters():
+            if '_orig' in name:
+                self.encoder_k.state_dict()[name].data = self.encoder_k.state_dict()[name].data * self.m \
+                    + torch.mul(para.data, self.encoder_q.state_dict()[name.replace('_orig','_mask')]) * (1. - self.m)
+            else:
+                self.encoder_k.state_dict()[name].data = self.encoder_k.state_dict()[name].data * self.m \
+                    + para.data * (1. - self.m)
+        for param_q, param_k in zip(self.encoder_q_head.parameters(), self.encoder_k_head.parameters()):
+            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+
+
+    def forward(self, im_q, im_k,trans_q,trans_k):
+        # TODO: check
+        """
+        Input:
+            im_q: a batch of query images
+            im_k: a batch of key images
+            trans_q: shape=(B,4), represent the linear transormations perform on image q,[kh,kw,bh,bw]
+            trans_k: shape=(B,4), represent the linear transormations perform on image k,[kh,kw,bh,bw]
+        Output:
+            logits, targets
+        """
+
+        # compute query features
+        q = self.encoder_q(im_q)  # queries: NxCxHxW
+        q = self.encoder_q_head(q) 
+        # TODO: Check if perform avg before norm can help classification
+        q = nn.functional.normalize(q,dim=1)
+        mean_x_q,mean_y_q = self._pred_feature_center(q)
+        q = self.avg_pool(q).squeeze() # q: NxC
+
+        # compute key features
+        with torch.no_grad():  # no gradient to keys
+            self._momentum_update_key_encoder()  # update the key encoder
+
+            # shuffle for making use of BN
+            im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
+
+            k = self.encoder_k(im_k)  # keys: NxCxWxH
+            k = self.encoder_k_head(k) 
+            k = nn.functional.normalize(k, dim=1)
+
+            # undo shuffle
+            k = self._batch_unshuffle_ddp(k, idx_unshuffle)
+
+            
+            # TODO: Check if perform avg before norm can help classification
+            mean_x_k,mean_y_k = self._pred_feature_center(k)
+            k = self.avg_pool(k).squeeze() # q: NxC
+
+        # compute logits
+        # Einstein sum is more intuitive
+        # positive logits: Nx1
+        l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
+        # negative logits: NxK
+        l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
+
+        # logits: Nx(1+K)
+        logits = torch.cat([l_pos, l_neg], dim=1)
+
+        # apply temperature
+        logits /= self.T
+
+        # labels: positive key indicators
+        labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
+
+        # dequeue and enqueue
+        self._dequeue_and_enqueue(k)
+
+        # calculate the shift difference for pos samples
+        l_reg_x = (mean_x_q-trans_q[2])/trans_q[0] - (mean_x_k-trans_k[2])/trans_k[0]
+        l_reg_y = (mean_y_q-trans_q[3])/trans_q[1] - (mean_y_k-trans_k[3])/trans_k[1]
+
+        reg_loss = torch.sum(l_reg_y**2 + l_reg_x **2)
+
+        return logits, labels,reg_loss
+    
+
+if __name__ == '__main__':
+    import torchvision.models as models
+    new_model = CAMMoCo(models.resnet50,None,mlp=True)
+    cp = torch.load('moco_v2_200ep_pretrain.pth.tar')
+    new_model.load_state_dict_from_MoCo(cp['state_dict'])

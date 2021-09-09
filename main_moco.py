@@ -26,6 +26,7 @@ import moco.loader
 import moco.builder
 from torch.utils.tensorboard import SummaryWriter
 from utils import backup_code,para_count_conv_mask
+import augment
 
 
 model_names = sorted(name for name in models.__dict__
@@ -53,7 +54,7 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                          'using Data Parallel or Distributed Data Parallel')
 parser.add_argument('--lr', '--learning-rate', default=0.003, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
-parser.add_argument('--schedule', default=[100, 160], nargs='*', type=int,
+parser.add_argument('--schedule', default=[120, 160], nargs='*', type=int,
                     help='learning rate schedule (when to drop lr by 10x)')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum of SGD solver')
@@ -114,7 +115,9 @@ parser.add_argument('--mask_encode',type=str,choices=['query','key','all'],defau
 parser.add_argument('--unstructure',type=str2bool,default='True')
 parser.add_argument('--mask_module',type=str,choices=['conv','bn'],default='conv')
 parser.add_argument('--use_pretrained_model',type=str,default='moco_v2_200ep_pretrain.pth.tar')
-parser.add_argument('--train_mini',type=str2bool,default='False')
+parser.add_argument('--mini_train',type=str2bool,default='False')
+parser.add_argument('--use_trans_match',type=str2bool,default='False')
+parser.add_argument('--reg_loss_penalty',type=float,default=1.0)
 
 
 def deal_with_args(arg):
@@ -214,9 +217,14 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     # create model
     print("=> creating model '{}'".format(args.arch))
-    model = moco.builder.MoCoUnstructruedPruned(
-        models.__dict__[args.arch],args,
-        args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
+    if not args.use_trans_match:
+        model = moco.builder.MoCoUnstructruedPruned(
+            models.__dict__[args.arch],args,
+            args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
+    else:
+        model = moco.builder.CAMMoCo(
+            models.__dict__[args.arch],args,
+            args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
     print(model)
     if args.use_pretrained_model:
         if os.path.isfile(args.use_pretrained_model):
@@ -232,12 +240,13 @@ def main_worker(gpu, ngpus_per_node, args):
                 cp[ky[7:]] = checkpoint['state_dict'][ky]
             #print('before:',model.queue)
             #print('keys in cp',cp.keys())
-            st = model.state_dict()
-            #print('keys in st',st.keys())
-            st.update(cp)
-            model.load_state_dict(st)
-            #print('end:',model.queue)
-            model.encoder_k.load_state_dict(model.encoder_q.state_dict())
+            if not args.use_trans_match:
+                st = model.state_dict()
+                st.update(cp)
+                model.load_state_dict(st)
+                model.encoder_k.load_state_dict(model.encoder_q.state_dict())
+            else:
+                model.load_state_dict_from_MoCo(cp)
 
             print("=> use pretrained model '{}' (epoch {})"
                   .format(args.use_pretrained_model, checkpoint['epoch']))
@@ -302,39 +311,47 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> no checkpoint found at '{}'".format(args.resume))
     
     # Data loading code
-    if args.train_mini:
-        traindir = os.path.join(args.data, 'train_mini')
+    if args.mini_train:
+        traindir = os.path.join(args.data, 'mini_train')
     else:
         traindir = os.path.join(args.data, 'train')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-    if args.aug_plus:
-        # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
-        augmentation = [
-            transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
-            transforms.RandomApply([
-                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
-            ], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize
-        ]
-    else:
-        # MoCo v1's aug: the same as InstDisc https://arxiv.org/abs/1805.01978
-        augmentation = [
-            transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize
-        ]
+    
+    if not args.use_trans_match:
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                        std=[0.229, 0.224, 0.225])
+        if args.aug_plus:
+            # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
+            augmentation = [
+                transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
+                transforms.RandomApply([
+                    transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
+                ], p=0.8),
+                transforms.RandomGrayscale(p=0.2),
+                transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize
+            ]
+        else:
+            # MoCo v1's aug: the same as InstDisc https://arxiv.org/abs/1805.01978
+            augmentation = [
+                transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
+                transforms.RandomGrayscale(p=0.2),
+                transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize
+            ]
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        moco.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+        train_dataset = datasets.ImageFolder(
+            traindir,
+            moco.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+    else:
+        augmentation = augment.AugPlus()
+        train_dataset = datasets.ImageFolder(
+            traindir,
+            augmentation
+        )
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -352,7 +369,10 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args,writer)
+        if args.use_trans_match:
+            train_trans(train_loader, model, criterion, optimizer, epoch, args,writer)
+        else:
+            train(train_loader, model, criterion, optimizer, epoch, args,writer)
         if epoch in args.prune_steps:
             remain_rate *= (1-args.prune_rate)
             print('remain_percent:',remain_rate)
@@ -418,6 +438,64 @@ def train(train_loader, model, criterion, optimizer, epoch, args,writer:SummaryW
         writer.add_scalar('top1',top1.avg,epoch)
         writer.add_scalar('prune_rate',get_prune_rate(args,epoch),epoch)
 
+
+
+def train_trans(train_loader, model, criterion, optimizer, epoch, args,writer:SummaryWriter):
+    batch_time = AverageMeter('Time', ':6.3f')
+    data_time = AverageMeter('Data', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    reg_losses = AverageMeter('RegLoss', ':.4e')
+    cls_losses = AverageMeter('ClsLoss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    progress = ProgressMeter(
+        len(train_loader),
+        [batch_time, data_time, losses, reg_losses, cls_losses, top1, top5],
+        prefix="Epoch: [{}]".format(epoch))
+
+    # switch to train mode
+    model.train()
+
+    end = time.time()
+    for i, (images, _) in enumerate(train_loader):
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        if args.gpu is not None:
+            images[0] = images[0].cuda(args.gpu, non_blocking=True)
+            images[1] = images[1].cuda(args.gpu, non_blocking=True)
+            images[2] = images[2].cuda(args.gpu, non_blocking=True)
+            images[3] = images[3].cuda(args.gpu, non_blocking=True)
+        # compute output
+        output, target,reg_loss = model(im_q=images[0], im_k=images[1],trans_q=images[2],trans_k=images[3])
+        cls_loss = criterion(output, target)
+        loss = cls_loss + args.reg_loss_penalty * reg_loss
+
+        # acc1/acc5 are (K+1)-way contrast classifier accuracy
+        # measure accuracy and record loss
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        losses.update(loss.item(), images[0].size(0))
+        reg_losses.update(reg_loss.item(),images[0].size(0))
+        cls_losses.update(cls_loss.item(),images[0].size(0))
+        top1.update(acc1[0], images[0].size(0))
+        top5.update(acc5[0], images[0].size(0))
+
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+        if i % args.print_freq == 0:
+            progress.display(i)
+    if writer is not None:
+        writer.add_scalar('loss',losses.avg,epoch)
+        writer.add_scalar('cls_loss',cls_losses.avg,epoch)
+        writer.add_scalar('reg_loss',reg_losses.avg,epoch)
+        writer.add_scalar('top1',top1.avg,epoch)
+        writer.add_scalar('prune_rate',get_prune_rate(args,epoch),epoch)
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
