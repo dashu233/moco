@@ -107,19 +107,21 @@ parser.add_argument('--cos', action='store_true',
 def str2bool(a:str):
     return a.lower() == 'true'
 
-parser.add_argument('--prune_rate',type = float, default=0.9)
+parser.add_argument('--prune_rate',type = float, default=0.2)
 parser.add_argument('--prune_steps',type = str, default='[10]')
 parser.add_argument('--prune_method',type = str, default='IMP')
 parser.add_argument('--mask_encode',type=str,choices=['query','key','all'],default='query')
 parser.add_argument('--unstructure',type=str2bool,default='True')
 parser.add_argument('--mask_module',type=str,choices=['conv','bn'],default='conv')
 parser.add_argument('--use_pretrained_model',type=str,default='moco_v2_200ep_pretrain.pth.tar')
+parser.add_argument('--train_mini',type=str2bool,default='False')
+
 
 def deal_with_args(arg):
     arg.prune_steps = json.loads(arg.prune_steps)
     return arg
 def get_prune_rate(arg,ep):
-    return 0.2
+    return arg.prune_rate
     
 def main():
     args = parser.parse_args()
@@ -300,7 +302,10 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> no checkpoint found at '{}'".format(args.resume))
     
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
+    if args.train_mini:
+        traindir = os.path.join(args.data, 'train_mini')
+    else:
+        traindir = os.path.join(args.data, 'train')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
     if args.aug_plus:
