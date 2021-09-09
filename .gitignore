@@ -2,6 +2,7 @@
 output
 detection/output
 datasets
+history
 .git
 experiments
 instant_test_output

@@ -53,7 +53,7 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                          'using Data Parallel or Distributed Data Parallel')
 parser.add_argument('--lr', '--learning-rate', default=0.003, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
-parser.add_argument('--schedule', default=[30, 160], nargs='*', type=int,
+parser.add_argument('--schedule', default=[100, 160], nargs='*', type=int,
                     help='learning rate schedule (when to drop lr by 10x)')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum of SGD solver')
@@ -113,17 +113,13 @@ parser.add_argument('--prune_method',type = str, default='IMP')
 parser.add_argument('--mask_encode',type=str,choices=['query','key','all'],default='query')
 parser.add_argument('--unstructure',type=str2bool,default='True')
 parser.add_argument('--mask_module',type=str,choices=['conv','bn'],default='conv')
-
+parser.add_argument('--use_pretrained_model',type=str,default='moco_v2_200ep_pretrain.pth.tar')
 
 def deal_with_args(arg):
     arg.prune_steps = json.loads(arg.prune_steps)
     return arg
 def get_prune_rate(arg,ep):
-    epi = 0
-    for epi in arg.prune_steps:
-        if epi > ep:
-            break
-    return 1-(1-arg.prune_rate)**((arg.prune_steps.index(epi)+1)/len(arg.prune_steps))
+    return 0.2
     
 def main():
     args = parser.parse_args()
@@ -142,8 +138,14 @@ def main():
         os.mkdir(os.path.join(args.output,'log'))
     if not os.path.exists(os.path.join(args.output,'backup')):
         os.mkdir(os.path.join(args.output,'backup'))
+    if not os.path.exists('history'):
+        os.mkdir('history')
+    now_time = time.strftime("%a-%b-%d-%H-%M-%S-%Y", time.localtime()) 
+    if not os.path.exists(os.path.join('history',now_time)):
+        os.mkdir(os.path.join('history',now_time))
     
     backup_code('./',os.path.join(args.output,'backup'))
+    backup_code('./',os.path.join('history',now_time))
 
 
     if args.seed is not None:
@@ -214,29 +216,35 @@ def main_worker(gpu, ngpus_per_node, args):
         models.__dict__[args.arch],args,
         args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
     print(model)
-    model.add_prune_mask()
-        # optionally resume from a checkpoint
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
+    if args.use_pretrained_model:
+        if os.path.isfile(args.use_pretrained_model):
+            print("=> loading checkpoint '{}'".format(args.use_pretrained_model))
             if args.gpu is None:
-                checkpoint = torch.load(args.resume)
+                checkpoint = torch.load(args.use_pretrained_model)
             else:
                 # Map model to be loaded to specified single gpu.
                 loc = 'cuda:{}'.format(args.gpu)
-                checkpoint = torch.load(args.resume, map_location=loc)
-            args.start_epoch = checkpoint['epoch']
+                checkpoint = torch.load(args.use_pretrained_model, map_location=loc)
             cp = {}
             for ky in checkpoint['state_dict']:
                 cp[ky[7:]] = checkpoint['state_dict'][ky]
+            #print('before:',model.queue)
+            #print('keys in cp',cp.keys())
             st = model.state_dict()
+            #print('keys in st',st.keys())
             st.update(cp)
             model.load_state_dict(st)
-            #optimizer.load_state_dict(checkpoint['optimizer'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
+            #print('end:',model.queue)
+            model.encoder_k.load_state_dict(model.encoder_q.state_dict())
+
+            print("=> use pretrained model '{}' (epoch {})"
+                  .format(args.use_pretrained_model, checkpoint['epoch']))
         else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
+            print("=> no checkpoint found at '{}'".format(args.use_pretrained_model))
+
+    model.add_prune_mask()
+        # optionally resume from a checkpoint
+    
     
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -283,12 +291,14 @@ def main_worker(gpu, ngpus_per_node, args):
                 # Map model to be loaded to specified single gpu.
                 loc = 'cuda:{}'.format(args.gpu)
                 checkpoint = torch.load(args.resume, map_location=loc)
-            
+            args.start_epoch = checkpoint['epoch']
+            model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
+    
     # Data loading code
     traindir = os.path.join(args.data, 'train')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -330,6 +340,7 @@ def main_worker(gpu, ngpus_per_node, args):
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
+    remain_rate = 1
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
@@ -338,6 +349,8 @@ def main_worker(gpu, ngpus_per_node, args):
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, args,writer)
         if epoch in args.prune_steps:
+            remain_rate *= (1-args.prune_rate)
+            print('remain_percent:',remain_rate)
             prune_rate = get_prune_rate(args,epoch)
             model.module.prune_step(prune_rate)
 
@@ -393,7 +406,6 @@ def train(train_loader, model, criterion, optimizer, epoch, args,writer:SummaryW
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
-
         if i % args.print_freq == 0:
             progress.display(i)
     if writer is not None:
@@ -457,6 +469,7 @@ def adjust_learning_rate(optimizer, epoch, args):
     else:  # stepwise lr schedule
         for milestone in args.schedule:
             lr *= 0.1 if epoch >= milestone else 1.
+    print('learning rate:',lr)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
