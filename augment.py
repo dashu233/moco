@@ -49,7 +49,8 @@ class AugPlus(nn.Module):
         img1 = self.jitter(img1)
         img1 = self.grayscale(img1)
         img1 = self.blur(img1)
-        img1,flip1 = self.hflip(img1)
+        #img1,flip1 = self.hflip(img1)
+        flip1=0
         img1 = self.totensor(img1)
         img1 = self.normalize(img1)
         
@@ -59,7 +60,8 @@ class AugPlus(nn.Module):
         img2 = self.jitter(img2)
         img2 = self.grayscale(img2)
         img2 = self.blur(img2)
-        img2,flip2 = self.hflip(img2)
+        #img2,flip2 = self.hflip(img2)
+        flip2 = 0
         img2 = self.totensor(img2)
         img2 = self.normalize(img2)
         
@@ -85,4 +87,5 @@ if __name__ == '__main__':
     print(torch.where(i1>0.1))
     print(torch.where(i2>0.1))
     print(aug[2],aug[3])
+    torchvision.models.resnet50
         

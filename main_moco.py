@@ -9,6 +9,7 @@ import shutil
 import time
 import warnings
 
+
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -18,15 +19,18 @@ import torch.optim
 import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
+import torchvision
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 import json
 import moco.loader
 import moco.builder
+import sys
 from torch.utils.tensorboard import SummaryWriter
 from utils import backup_code,para_count_conv_mask
 import augment
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 model_names = sorted(name for name in models.__dict__
@@ -61,7 +65,7 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
 parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)',
                     dest='weight_decay')
-parser.add_argument('-p', '--print-freq', default=10, type=int,
+parser.add_argument('-p', '--print-freq', default=100, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
@@ -117,7 +121,9 @@ parser.add_argument('--mask_module',type=str,choices=['conv','bn'],default='conv
 parser.add_argument('--use_pretrained_model',type=str,default='moco_v2_200ep_pretrain.pth.tar')
 parser.add_argument('--mini_train',type=str2bool,default='False')
 parser.add_argument('--use_trans_match',type=str2bool,default='False')
-parser.add_argument('--reg_loss_penalty',type=float,default=1.0)
+parser.add_argument('--reg_loss_penalty',type=float,default=1e-4)
+parser.add_argument('--checkpoint_interval',type=int,default=10)
+parser.add_argument('--l1_penalty',type=float,default=0.001)
 
 
 def deal_with_args(arg):
@@ -130,6 +136,7 @@ def main():
     args = parser.parse_args()
     args = deal_with_args(args)
     print(args.prune_steps)
+    print(args.schedule)
     
     if os.path.exists(args.output):
         print('an existed dir, enter e or exit to cancel the command, or anything else to continue')
@@ -244,7 +251,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 st = model.state_dict()
                 st.update(cp)
                 model.load_state_dict(st)
-                model.encoder_k.load_state_dict(model.encoder_q.state_dict())
+                model.key_copy()
             else:
                 model.load_state_dict_from_MoCo(cp)
 
@@ -254,7 +261,7 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> no checkpoint found at '{}'".format(args.use_pretrained_model))
 
     model.add_prune_mask()
-        # optionally resume from a checkpoint
+    # optionally resume from a checkpoint
     
     
     if args.distributed:
@@ -378,9 +385,17 @@ def main_worker(gpu, ngpus_per_node, args):
             print('remain_percent:',remain_rate)
             prune_rate = get_prune_rate(args,epoch)
             model.module.prune_step(prune_rate)
-
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
+            save_checkpoint({
+                'epoch': epoch + 1,
+                'arch': args.arch,
+                'state_dict': model.state_dict(),
+                'optimizer' : optimizer.state_dict(),
+            }, is_best=False, filename= os.path.join(args.output,'last_model.pth.tar'.format(epoch)))
+
+        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                and args.rank % ngpus_per_node == 0) and (epoch%args.checkpoint_interval == args.checkpoint_interval-1):
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
@@ -404,6 +419,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args,writer:SummaryW
     model.train()
 
     end = time.time()
+    #with record_function('train_loop'):
     for i, (images, _) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
@@ -413,6 +429,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args,writer:SummaryW
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
 
         # compute output
+        #with record_function('model_forward'):
         output, target = model(im_q=images[0], im_k=images[1])
         loss = criterion(output, target)
 
@@ -424,6 +441,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args,writer:SummaryW
         top5.update(acc5[0], images[0].size(0))
 
         # compute gradient and do SGD step
+        #with record_function('model_backward'):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -433,6 +451,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args,writer:SummaryW
         end = time.time()
         if i % args.print_freq == 0:
             progress.display(i)
+            sys.stdout.flush()
     if writer is not None:
         writer.add_scalar('loss',losses.avg,epoch)
         writer.add_scalar('top1',top1.avg,epoch)
@@ -479,17 +498,32 @@ def train_trans(train_loader, model, criterion, optimizer, epoch, args,writer:Su
         cls_losses.update(cls_loss.item(),images[0].size(0))
         top1.update(acc1[0], images[0].size(0))
         top5.update(acc5[0], images[0].size(0))
-
+        
+        # print("top1:{}".format(top1.avg))
+        
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
+        model.module.add_l1_loss(args.l1_penalty)
+        # for name, param in model.module.named_parameters():
+        #     if param.grad is None:
+        #         print(name)
 
+        optimizer.step()
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
         if i % args.print_freq == 0:
+            #print('diff:')
+            #print(output[:,0]-torch.max(output,dim=1).values)
+            # for name,m in model.module.encoder_q.named_parameters():
+            #     if m.grad is not None:
+            #         print(name,torch.norm(m.grad))
+            # for name,m in model.module.head.named_parameters():
+            #     if m.grad is not None:
+            #         print(name,torch.norm(m.grad))
             progress.display(i)
+            sys.stdout.flush()
     if writer is not None:
         writer.add_scalar('loss',losses.avg,epoch)
         writer.add_scalar('cls_loss',cls_losses.avg,epoch)
@@ -575,4 +609,10 @@ def accuracy(output, target, topk=(1,)):
 
 
 if __name__ == '__main__':
+    #with profile(activities=[
+    #    ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+    #    with record_function('main_process'):
     main()
+    #print(prof.key_averages().table(
+    #    sort_by="self_cuda_time_total", row_limit=-1))
+    

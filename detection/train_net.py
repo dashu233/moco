@@ -76,6 +76,14 @@ def main(args):
 
     trainer = Trainer(cfg)
     trainer.resume_or_load(resume=args.resume)
+    mask_weight_num = 0
+    all_weight_num = 0
+    for name, module in trainer.model.module.backbone.named_modules():
+            if isinstance(module, torch.nn.Conv2d):
+                mask_weight_num += torch.sum(module.weight_mask)
+                all_weight_num += module.weight.numel()
+    print('prune_rate:{}({}/{})'.format(mask_weight_num/all_weight_num,mask_weight_num,all_weight_num))
+
     return trainer.train()
 
 

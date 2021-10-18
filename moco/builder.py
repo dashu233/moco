@@ -2,6 +2,7 @@
 from numpy.lib.financial import ipmt
 import torch
 import torch.nn as nn
+from torch.nn.modules.linear import Linear
 import torch.nn.utils.prune as prune
 
 class MoCo(nn.Module):
@@ -160,9 +161,39 @@ class MoCo(nn.Module):
 
         return logits, labels
 
+
 class Identity(nn.Module):
     def forward(self,x):
         return x
+
+class FCHead(nn.Module):
+    def __init__(self,input_channel,dim_cls):
+        super().__init__()
+        self.input_channel = input_channel
+        self.dim_cls = dim_cls
+        conv1 = nn.Conv2d(input_channel,input_channel,kernel_size=1)
+        relu = nn.ReLU()
+        conv2 = nn.Conv2d(input_channel,dim_cls,kernel_size=1)
+        self.backbone = nn.Sequential(conv1,relu,conv2)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+    def forward(self,x):
+        # x.shape: B,C*H*W
+        B,CHW = x.shape
+        LS = int((CHW/self.input_channel)**0.5)
+        x = x.view(B,self.input_channel,LS,LS)
+        cls = self.backbone(self.avg_pool(x.clone())).flatten(1)
+        return cls,x
+
+class SkipFC(nn.Module):
+    def __init__(self,fc):
+        super().__init__()
+        self.fc = fc
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+    def forward(self,x):
+        B,CHW = x.size()
+        LS = int((CHW/2048)**0.5)
+        x = x.view(B,2048,LS,LS)
+        return self.fc(self.avg_pool(x).squeeze()),x
 
 class MoCoUnstructruedPruned(MoCo):
     def __init__(self, base_encoder, args,dim=128, K=65536, m=0.999, T=0.07, mlp=False):
@@ -175,13 +206,14 @@ class MoCoUnstructruedPruned(MoCo):
         """
         Momentum update of the key encoder, mask value will goes to zero
         """
-        for name,para in self.encoder_q.named_parameters():
+        tmp_dict = self.encoder_k.state_dict()
+        for name, param_k in self.encoder_k.named_parameters():
             if '_orig' in name:
-                self.encoder_k.state_dict()[name].data = self.encoder_k.state_dict()[name].data * self.m \
-                    + torch.mul(para.data, self.encoder_q.state_dict()[name.replace('_orig','_mask')]) * (1. - self.m)
+                param_k.data = param_k.data * self.m + \
+                    torch.mul(self.encoder_q.state_dict()[name].data,self.encoder_q.state_dict()[name.replace('_orig','_mask')].data) * (1. - self.m)
             else:
-                self.encoder_k.state_dict()[name].data = self.encoder_k.state_dict()[name].data * self.m \
-                    + para.data * (1. - self.m)
+                param_k.data = param_k.data * self.m + \
+                    self.encoder_q.state_dict()[name].data * (1. - self.m)
         
 
     def prune_step(self,param_prune_rate:float):
@@ -206,7 +238,10 @@ class MoCoUnstructruedPruned(MoCo):
                 prune.random_unstructured(m,'weight',0)
                 
         self.parameters_to_prune = tuple(self.parameters_to_prune)
-
+    def key_copy(self):
+        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
+            param_k.data.copy_(param_q.data)  # initialize
+            param_k.requires_grad = False  # not update by gradient
 
 
 # utils
@@ -226,36 +261,69 @@ def concat_all_gather(tensor):
 class CAMMoCo(MoCoUnstructruedPruned):
     def __init__(self, base_encoder, args, dim=128, K=65536, m=0.999, T=0.07, mlp=False):
         super().__init__(base_encoder, args, dim=dim, K=K, m=m, T=T, mlp=mlp)
-        self.encoder_k.avg_pool = Identity()
-        self.encoder_q.avg_pool = Identity()
+        self.encoder_k.avgpool = Identity()
+        self.encoder_q.avgpool = Identity()
         dim_mlp = self.encoder_q.fc[0].weight.shape[1]
         dim_cat = self.encoder_q.fc[2].weight.shape[0]
-        self.encoder_q.fc = Identity()
-        self.encoder_k.fc = Identity()
-        self.encoder_q_head = nn.Sequential(nn.Conv2d(dim_mlp,dim_mlp,1),nn.ReLU(),nn.Conv2d(dim_mlp,dim_cat,1))
-        self.encoder_k_head = nn.Sequential(nn.Conv2d(dim_mlp,dim_mlp,1),nn.ReLU(),nn.Conv2d(dim_mlp,dim_cat,1))
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-    def load_state_dict_from_MoCo(self,state_dict):
-        st = self.state_dict()
-        for ky in state_dict:
-            if ky[7:] in st:
-                #print('load {} in original model para'.format(ky))
-                st[ky[7:]] = state_dict[ky]
-            else:
-                #print(ky)
-                if ky == 'module.encoder_q.fc.0.weight' or ky == 'module.encoder_q.fc.2.weight':
-                    sp = state_dict[ky].shape
-                    st[ky[7:].replace('.fc','_head')] = state_dict[ky].reshape(sp[0],sp[1],1,1)
-                elif ky == 'module.encoder_q.fc.0.bias' or ky == 'module.encoder_q.fc.2.bias' :
-                    st[ky[7:].replace('.fc','_head')] = state_dict[ky]
-                else:
-                    print('missing key:',ky)
+
+        self.encoder_q.fc = SkipFC(self.encoder_q.fc)
+        self.encoder_k.fc = SkipFC(self.encoder_k.fc)
         
-        self.load_state_dict(st)
+        class Head(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv1 = nn.Conv2d(dim_mlp,dim_mlp//2,kernel_size=3,padding=1)
+                self.bn1 = nn.BatchNorm2d(dim_mlp//2)
+                self.relu = nn.ReLU()
+                self.conv2 = nn.Conv2d(dim_mlp//2,dim_mlp//4,kernel_size=3,padding=1)
+                self.bn2 = nn.BatchNorm2d(dim_mlp//4)
+                self.linear = nn.Linear(dim_mlp//4*49,4)
+
+            def forward(self, x):
+                x = self.relu(self.bn1(self.conv1(x)))
+                x = self.relu(self.bn2(self.conv2(x)))
+                x = x.flatten(1)
+                x = self.linear(x)
+                return x
+
+        self.head = Head()
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.data.copy_(param_q.data)  # initialize
             param_k.requires_grad = False  # not update by gradient
-        for param_q, param_k in zip(self.encoder_q_head.parameters(), self.encoder_k_head.parameters()):
+        
+
+    def load_state_dict_from_MoCo(self,state_dict):
+        st = self.state_dict()
+        for ky in state_dict:
+            if 'module' in ky:
+                if ky[7:] in st:
+                    #print('load {} in original model para'.format(ky))
+                    st[ky[7:]] = state_dict[ky]
+                else:
+                    #print(ky)
+                    if ky == 'module.encoder_q.fc.0.weight' or ky == 'module.encoder_q.fc.2.weight':
+                        sp = state_dict[ky].shape
+                        st[ky[7:].replace('.fc','.fc.fc')] = state_dict[ky]
+                    elif ky == 'module.encoder_q.fc.0.bias' or ky == 'module.encoder_q.fc.2.bias' :
+                        st[ky[7:].replace('.fc','.fc.fc')] = state_dict[ky]
+                    else:
+                        print('missing key:',ky)
+            else:
+                if ky in st:
+                    #print('load {} in original model para'.format(ky))
+                    st[ky] = state_dict[ky]
+                else:
+                    #print(ky)
+                    if ky == 'encoder_q.fc.0.weight' or ky == 'encoder_q.fc.2.weight':
+                        sp = state_dict[ky].shape
+                        st[ky.replace('.fc','.fc.fc')] = state_dict[ky]
+                    elif ky == 'encoder_q.fc.0.bias' or ky == 'encoder_q.fc.2.bias' :
+                        st[ky.replace('.fc','.fc.fc')] = state_dict[ky]
+                    else:
+                        print('missing key:',ky)
+        
+        self.load_state_dict(st)
+        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.data.copy_(param_q.data)  # initialize
             param_k.requires_grad = False  # not update by gradient
         
@@ -266,33 +334,18 @@ class CAMMoCo(MoCoUnstructruedPruned):
         cam_prob_map = torch.softmax(cam_map,dim=3)
         cam_prob_map = cam_prob_map.view(B,-1,C)
 
-        xind = torch.arange(0, H,step=1,dtype=torch.long)
-        yind = torch.arange(0, W,step=1,dtype=torch.long)
+        xind = torch.arange(0, H,step=1,dtype=torch.long,device=cam_prob_map.device)
+        yind = torch.arange(0, W,step=1,dtype=torch.long,device=cam_prob_map.device)
         
         grid_x,grid_y = torch.meshgrid([xind,yind])
-        grid_x = grid_x.view(1,-1,1)
-        grid_y = grid_y.view(1,-1,1)
+        grid_x = grid_x.reshape(1,-1,1)
+        grid_y = grid_y.reshape(1,-1,1)
 
-        mean_x = torch.sum(cam_prob_map*grid_x,dim=1)
-        mean_y = torch.sum(cam_prob_map*grid_y,dim=1)
+        mean_x = torch.mean(cam_prob_map*grid_x,dim=1)
+        mean_y = torch.mean(cam_prob_map*grid_y,dim=1)
 
         # mean_{x,y}.shape = B,C
         return mean_x,mean_y
-
-    @torch.no_grad()
-    def _momentum_update_key_encoder(self):
-        """
-        Momentum update of the key encoder, mask value will goes to zero
-        """
-        for name,para in self.encoder_q.named_parameters():
-            if '_orig' in name:
-                self.encoder_k.state_dict()[name].data = self.encoder_k.state_dict()[name].data * self.m \
-                    + torch.mul(para.data, self.encoder_q.state_dict()[name.replace('_orig','_mask')]) * (1. - self.m)
-            else:
-                self.encoder_k.state_dict()[name].data = self.encoder_k.state_dict()[name].data * self.m \
-                    + para.data * (1. - self.m)
-        for param_q, param_k in zip(self.encoder_q_head.parameters(), self.encoder_k_head.parameters()):
-            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
 
 
     def forward(self, im_q, im_k,trans_q,trans_k):
@@ -308,13 +361,14 @@ class CAMMoCo(MoCoUnstructruedPruned):
         """
 
         # compute query features
-        q = self.encoder_q(im_q)  # queries: NxCxHxW
-        q = self.encoder_q_head(q) 
-        # TODO: Check if perform avg before norm can help classification
+        q,q_cam = self.encoder_q(im_q)  # queries: NxCxHxW
+        
+        q_pred = self.head(q_cam)
         q = nn.functional.normalize(q,dim=1)
-        mean_x_q,mean_y_q = self._pred_feature_center(q)
-        q = self.avg_pool(q).squeeze() # q: NxC
-
+        #mean_x_q,mean_y_q = self._pred_feature_center(q_cam)
+        
+        #print(q.shape)
+        #print(q)
         # compute key features
         with torch.no_grad():  # no gradient to keys
             self._momentum_update_key_encoder()  # update the key encoder
@@ -322,21 +376,24 @@ class CAMMoCo(MoCoUnstructruedPruned):
             # shuffle for making use of BN
             im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
 
-            k = self.encoder_k(im_k)  # keys: NxCxWxH
-            k = self.encoder_k_head(k) 
-            k = nn.functional.normalize(k, dim=1)
-
+            k,k_cam = self.encoder_k(im_k)  # queries: NxCxHxW
             # undo shuffle
+            
+            k = nn.functional.normalize(k.squeeze(),dim=1)
             k = self._batch_unshuffle_ddp(k, idx_unshuffle)
 
+            k_pred = self.head(k_cam)
+            k_pred = self._batch_unshuffle_ddp(k_pred, idx_unshuffle)
             
-            # TODO: Check if perform avg before norm can help classification
-            mean_x_k,mean_y_k = self._pred_feature_center(k)
-            k = self.avg_pool(k).squeeze() # q: NxC
 
+            #mean_x_k,mean_y_k = self._pred_feature_center(k_cam)
+            
         # compute logits
         # Einstein sum is more intuitive
         # positive logits: Nx1
+
+        #print(k.shape)
+        #print(k)
         l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
         # negative logits: NxK
         l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
@@ -354,16 +411,42 @@ class CAMMoCo(MoCoUnstructruedPruned):
         self._dequeue_and_enqueue(k)
 
         # calculate the shift difference for pos samples
-        l_reg_x = (mean_x_q-trans_q[2])/trans_q[0] - (mean_x_k-trans_k[2])/trans_k[0]
-        l_reg_y = (mean_y_q-trans_q[3])/trans_q[1] - (mean_y_k-trans_k[3])/trans_k[1]
+        #print('mean_x_q.shape:',mean_x_q.shape)
+        #print('trans_q:',trans_q)
+        #l_reg_x = (mean_x_q-trans_q[:,2].unsqueeze(1))/trans_q[:,0].unsqueeze(1) - (mean_x_k-trans_k[:,2].unsqueeze(1))/trans_k[:,0].unsqueeze(1)
+        #l_reg_y = (mean_y_q-trans_q[:,3].unsqueeze(1))/trans_q[:,1].unsqueeze(1) - (mean_y_k-trans_k[:,3].unsqueeze(1))/trans_k[:,1].unsqueeze(1)
 
-        reg_loss = torch.sum(l_reg_y**2 + l_reg_x **2)
-
+        # b loss
+        l1loss = torch.nn.SmoothL1Loss()
+        reg_loss =  l1loss(q_pred[:,0:2]/k_pred[:,0:2],trans_q[:,:2]/trans_k[:,0:2]) \
+            + l1loss(q_pred[:,2:]-k_pred[:,2:],trans_q[:,2:]-trans_k[:,2:])
+        #print('true_distance:',trans_q[0,2:]-trans_k[0,2:])
         return logits, labels,reg_loss
-    
 
+    def key_copy(self):
+        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
+            param_k.data.copy_(param_q.data)  # initialize
+            param_k.requires_grad = False  # not update by gradient
+        # for param_q, param_k in zip(self.encoder_q_head.parameters(), self.encoder_k_head.parameters()):
+        #     param_k.data.copy_(param_q.data)  # initialize
+        #     param_k.requires_grad = False  # not update by gradient
+    def add_prune_mask(self):
+        # add prune mask for query
+        self.parameters_to_prune = []
+        for name,m in self.encoder_q.named_modules():
+            if isinstance(m,nn.Conv2d) and 'fc.' not in name:
+                prune.random_unstructured(m,'weight',0)
+                self.parameters_to_prune.append((m,'weight'))
+        for name,m in self.encoder_k.named_modules():
+            if isinstance(m,nn.Conv2d) and 'fc.' not in name:
+                prune.random_unstructured(m,'weight',0)
+        self.parameters_to_prune = tuple(self.parameters_to_prune)
+    def add_l1_loss(self,gamma):
+        for name,m in self.encoder_q.named_modules():
+            if isinstance(m,nn.Conv2d) and 'fc.' not in name:
+                m.weight_orig.grad += torch.where(m.weight>0,1,-1)*gamma
+        
 if __name__ == '__main__':
-    import torchvision.models as models
     new_model = CAMMoCo(models.resnet50,None,mlp=True)
     cp = torch.load('moco_v2_200ep_pretrain.pth.tar')
     new_model.load_state_dict_from_MoCo(cp['state_dict'])

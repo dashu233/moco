@@ -1,12 +1,14 @@
 # output dir
 output
 detection/output
+detection/datasets
 datasets
 history
 .git
 experiments
 instant_test_output
 inference_test_output
+pretrain_model
 
 
 *.jpg

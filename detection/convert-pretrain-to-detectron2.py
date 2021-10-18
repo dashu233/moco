@@ -21,6 +21,10 @@ if __name__ == "__main__":
         k = k.replace(start_key, "")
         if "layer" not in k:
             k = "stem." + k
+
+        if ('conv' in k or 'shortcut' in k) and not 'bn' in k and 'weight' in k and 'weight_orig' not in k and 'weight_mask' not in k:
+            k = k.replace('weight','weight_orig')
+
         for t in [1, 2, 3, 4]:
             k = k.replace("layer{}".format(t), "res{}".format(t + 1))
         for t in [1, 2, 3]:
